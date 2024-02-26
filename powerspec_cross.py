@@ -43,6 +43,10 @@ def compute_power_spectrum(overdensity_field, velocity_field, box_size):
     return k_val, Pk
 
 
+def compute_limber_integral():
+
+    return ell, Cell
+
 # Compute 3D power spectrum of matter overdensity x velocity. 
 outpath = "/cosma8/data/do012/dc-yama3/"
 box_size = 1000.0 # Define the size of your simulation box in the same units as positions
