@@ -78,6 +78,13 @@ def create_density_field(filename, grid_size, box_size, gas_only=False):
         elif parttype == 'neutrinos':
             positions = data.neutrinos.coordinates.value
             masses = data.neutrinos.masses.value
+        elif parttype == 'stars':
+            positions = data.stars.coordinates.value
+            masses = data.stars.masses.value
+        elif parttype == 'black_holes':
+            # positions = data.black_holes.coordinates.value
+            # masses = data.black_holes.masses.value
+            continue
         else:
             print('unknown particle types')
             raise ValueError('Unknow particle types')
@@ -177,19 +184,30 @@ def calculate_velocity_field(a, ne, vx, vy, vz):
 
     return v2
 
+# MPI
+from mpi4py import MPI
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
+print(rank, size)
 
 # Compute 3D power spectrum of matter overdensity x velocity. 
-outpath = "/cosma8/data/do012/dc-yama3/"
+outpath = "/cosma8/data/do012/dc-yama3/L1000N1800"
 box_size = 1000.0 # Define the size of your simulation box in the same units as positions
 box_num = 64
 grid_size = 512 # Define grid resolution
-snapshots = [str(i).zfill(4) for i in range(64)]
-snapshot = snapshots[0] # Just look at snapshot-0000 for now. Will parallelize this for running this over all the snapshots. 
+snapshots = [str(i).zfill(4) for i in range(78)]
+snapshot = snapshots[0]
 filenames = glob.glob('/cosma8/data/dp004/flamingo/Runs/L1000N1800/HYDRO_FIDUCIAL/snapshots/flamingo_%s/flamingo_%s.*.hdf5' % (snapshot, snapshot))
 overdensity_3d = np.zeros((box_num, grid_size, grid_size, grid_size))
 velocity_3d = np.zeros((box_num, grid_size, grid_size, grid_size))
-print('processing %s files' % str(len(filenames)))
+# print('processing %s files' % str(len(filenames)))
 for i,filename in tqdm(enumerate(filenames)):
+
+    if i % size != rank:
+        continue
+    if i % 10 == 0:
+        print('reached ', i)
 
     density_field = create_density_field(filename, grid_size, box_size) # TO-DO: implement weight interpolation. 
     overdensity_field = calculate_overdensity(density_field, apodization=True, sigma=2.0)
@@ -206,11 +224,32 @@ for i,filename in tqdm(enumerate(filenames)):
     v2_field = calculate_velocity_field(a, ne_field/gas_density_field, vx, vy, vz)
     velocity_3d[i,:,:,:] = v2_field
 
-if not os.path.exists(os.path.join(outpath, 'overdensity_3d_snapshot_%s.fits' % snapshot)):
-    fits = fio.FITS(os.path.join(outpath, 'overdensity_3d_snapshot_%s.fits' % snapshot), 'rw')
-    fits.write(overdensity_3d)
-    fits.close()
-if not os.path.exists(os.path.join(outpath, 'velocity_3d_snapshot_%s.fits' % snapshot)):
-    fits = fio.FITS(os.path.join(outpath, 'velocity_3d_snapshot_%s.fits' % snapshot), 'rw')
-    fits.write(velocity_3d)
-    fits.close()
+# send overdensity info
+if rank != 0:
+    comm.bcast(overdensity_3d, root=0)
+comm.Barrier()
+if rank == 0:
+    for i in range(1,size):
+        tmp_res = comm.recv(source=i)
+        overdensity_3d[i,:,:,:] = tmp_res[i,:,:,:]
+comm.Barrier()
+
+# send velocity info
+if rank != 0:
+    comm.bcast(velocity_3d, root=0)
+comm.Barrier()
+if rank == 0:
+    for i in range(1,size):
+        tmp_res = comm.recv(source=i)
+        velocity_3d[i,:,:,:] = tmp_res[i,:,:,:]
+comm.Barrier()
+
+if rank == 0:
+    if not os.path.exists(os.path.join(outpath, 'snapshot_%s/overdensity_3d_snapshot_%s.fits' % (snapshot, snapshot))):
+        fits = fio.FITS(os.path.join(outpath, 'snapshot_%s/overdensity_3d_snapshot_%s.fits' % (snapshot, snapshot)), 'rw')
+        fits.write(overdensity_3d)
+        fits.close()
+    if not os.path.exists(os.path.join(outpath, 'snapshot_%s/velocity_3d_snapshot_%s.fits' % (snapshot, snapshot))):
+        fits = fio.FITS(os.path.join(outpath, 'snapshot_%s/velocity_3d_snapshot_%s.fits' % (snapshot, snapshot)), 'rw')
+        fits.write(velocity_3d)
+        fits.close()

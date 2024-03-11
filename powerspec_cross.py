@@ -43,7 +43,13 @@ def compute_power_spectrum(overdensity_field, velocity_field, box_size):
     return k_val, Pk
 
 
-def compute_limber_integral():
+def compute_limber_integral(k, Pk):
+
+    from scipy.special import spherical_jn
+
+    ell = np.linspace(50, 3000, 1000)
+    for i,ell_ in enumerate(ell):
+        
 
     return ell, Cell
 
@@ -62,6 +68,6 @@ for i,snapshot in tqdm(enumerate(snapshots)):
     k_, Pk_ = compute_power_spectrum(overdensity_3d, velocity_3d, box_size)
     Pk[i, :] = Pk_
 
-# Do Limber integral. 
-# Compute 2D power spectrum by integrating 3D power spectrum over snapshots. 
-# k, Pk = compute_power_spectrum(overdensity_field, box_size)
+# Do integral over k (incl. Bessel function) for each snapshot. 
+
+# Do integral over chi_s, chi_rec () over all the snapshots. 
