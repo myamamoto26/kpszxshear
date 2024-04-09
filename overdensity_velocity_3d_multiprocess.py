@@ -1,103 +1,57 @@
 import numpy as np
-import h5py as h5
+import h5py
 import fitsio as fio
-import swiftsimio as sw
+# import swiftsimio as sw
 from tqdm import tqdm
 import glob
-import os
+import os,sys
+import time
 
-import joblib
-from numba import prange
-from numba import vectorize,guvectorize,float64,int64
-# from numba.np.ufunc import parallel
+import numba
+from mpi4py import MPI
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-def read_particle_positions(filename, particles, region=None, extra_mask=None):
-    """Read particle positions from an HDF5 file."""
+def calculate_velocity_field(a, ne, vx, vy, vz):
 
-    if region is None:
-        data = sw.load(filename)
-    else:
-        mask_data = sw.mask(filename)
-        mask_data.constrain_spatial(region)
-        data = sw.load(filename, mask=mask_data)
+    """Calculate the velocity field (* make sure it's in the right units) M=0 component.
+    """
 
-    if particles == 'dm':
-        positions = data.dark_matter.coordinates.value
-        velocities = data.dark_matter.velocities.value
-    elif particles == 'gas':
-        positions = data.gas.coordinates.value
-        velocities = data.gas.velocities.value
-    
-    if extra_mask is not None:
-        m = ((positions[:,0] > extra_mask[0][0]) & (positions[:,0] <= extra_mask[0][1]) &
-             (positions[:,1] > extra_mask[1][0]) & (positions[:,1] <= extra_mask[1][1]) & 
-             (positions[:,2] > extra_mask[2][0]) & (positions[:,2] <= extra_mask[2][1]))
+    thomson_cross = 6.9842656e-74 # Mpc^2
+    tau_dot = thomson_cross * a * ne # Mpc^-1
+    v2 = tau_dot * 1/np.sqrt(6) * (-vx**2 - vy**2 + 2*vz**2)
 
-    return positions[m], velocities[m]
+    return v2
 
 
-def read_gas_info(filename, region=None, extra_mask=None):
-
-    if region is None:
-        data = sw.load(filename)
-    else:
-        mask_data = sw.mask(filename)
-        mask_data.constrain_spatial(region)
-        data = sw.load(filename, mask=mask_data)
-        if extra_mask is not None:
-            positions = data.gas.coordinates.value
-            m = ((positions[:,0] > extra_mask[0][0]) & (positions[:,0] <= extra_mask[0][1]) &
-                (positions[:,1] > extra_mask[1][0]) & (positions[:,1] <= extra_mask[1][1]) & 
-                (positions[:,2] > extra_mask[2][0]) & (positions[:,2] <= extra_mask[2][1]))
-
-    return data.metadata.scale_factor, data.gas.electron_number_densities.value[m]
+def assign_files(nr_files, nr_ranks):
+    # Taken from VirgoDC
+    files_on_rank = np.zeros(nr_ranks, dtype=int)
+    files_on_rank[:] = nr_files // nr_ranks
+    remainder = nr_files % nr_ranks
+    if remainder > 0:
+        step = max(nr_files // (remainder+1), 1)
+        for i in range(remainder):
+            files_on_rank[(i*step) % nr_ranks] += 1
+    assert sum(files_on_rank) == nr_files
+    return files_on_rank
 
 
-def accumulate_density_field(positions, masses, grid_size, box_size, density_field):
+# Write values to field
+@numba.jit(nopython=True, parallel=False)
+def fill_field(field, indices, weight, value):
+    for i in range(len(weight)):
+        field[indices[i,0], indices[i,1], indices[i,2]] += value[i]
+
+    return field
+
+def accumulate_density_field(density_field, ptype, positions, masses, grid_size, box_size):
 
     """
     positions: (Npart, 3)
     masses: (Npart,)
     density_field: (grid_size, grid_size, grid_size)
     """
-    scaled_positions = (positions / box_size) * grid_size
-        
-    # Calculate the indices of the "lower left" corner grid point for each particle
-    indices = np.floor(scaled_positions).astype(np.int32)
-    
-    # Calculate the distance of each particle from the "lower left" grid point in grid units
-    delta = scaled_positions - indices
-    
-    # For each particle, distribute its mass to the surrounding 8 grid points
-    for offset in [(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1),
-                (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)]:
-
-        # Calculate the weight for the current offset
-        offset = np.array(offset)
-        # weight = (1 - np.abs(delta - offset)).prod(axis=1)
-        w = 1 - np.abs(delta - offset)
-        weight = w[:,0] * w[:,1] * w[:,2]
-        
-        # Calculate the affected grid points, wrapping around using modulo for periodic boundary conditions
-        affected_indices = (indices + offset) % grid_size
-        
-        # Use np.add.at for unbuffered in-place addition, distributing weights to the density_field
-        np.add.at(density_field, 
-                (affected_indices[:, 0], affected_indices[:, 1], affected_indices[:, 2]), 
-                weight * masses)
-
-    return density_field
-
-
-@guvectorize([(float64[:,:], float64[:], int64, float64, int64[:], float64[:,:,:])], '(n,m),(n),(),(),(p)->(p,p,p)', nopython=True)
-def accumulate_density_field_vectorized(positions, masses, grid_size, box_size, dum, density_field):
-
-    """
-    positions: (Npart, 3)
-    masses: (Npart,)
-    density_field: (grid_size, grid_size, grid_size)
-    """
-    scaled_positions = (positions / box_size) * grid_size
+    scaled_positions = (positions[ptype] / box_size) * grid_size
         
     # Calculate the indices of the "lower left" corner grid point for each particle
     indices = np.floor(scaled_positions).astype(np.int64)
@@ -117,64 +71,10 @@ def accumulate_density_field_vectorized(positions, masses, grid_size, box_size, 
         
         # Calculate the affected grid points, wrapping around using modulo for periodic boundary conditions
         affected_indices = (indices + offset) % grid_size
-        
-        # Use np.add.at for unbuffered in-place addition, distributing weights to the density_field
-        # np.add.at(density_field, 
-        #         (affected_indices[:, 0], affected_indices[:, 1], affected_indices[:, 2]), 
-        #         weight * masses)
-        for i in prange(len(weight)):
-            density_field[affected_indices[i,0], affected_indices[i,1], affected_indices[i,2]] += weight[i]*masses[i]
 
-    # return density_field
+        density_field = fill_field(density_field, affected_indices, weight, weight*masses[ptype])
 
-
-def prep_density_field(filename, grid_size, box_size, region=None, extra_mask=None):
-    """Create a density field using the Cloud-In-Cell (CIC) method."""
-
-    if region is None:
-        data = sw.load(filename)
-    else:
-        mask_data = sw.mask(filename)
-        mask_data.constrain_spatial(region)
-        data = sw.load(filename, mask=mask_data)
-
-    particles = data.metadata.present_particle_names
-    fields = {}
-    for parttype in particles:
-        print('particle type, ', parttype)
-        if parttype == 'dark_matter':
-            positions = data.dark_matter.coordinates.value
-            masses = data.dark_matter.masses.value
-        elif parttype == 'gas':
-            positions = data.gas.coordinates.value
-            masses = data.gas.masses.value
-        elif parttype == 'neutrinos':
-            positions = data.neutrinos.coordinates.value
-            masses = data.neutrinos.masses.value
-        elif parttype == 'stars':
-            positions = data.stars.coordinates.value
-            masses = data.stars.masses.value
-        elif parttype == 'black_holes':
-            # positions = data.black_holes.coordinates.value
-            # masses = data.black_holes.masses.value
-            continue
-        else:
-            print('unknown particle types')
-            raise ValueError('Unknow particle types')
-
-        if extra_mask is not None:
-            m = ((positions[:,0] > extra_mask[0][0]) & (positions[:,0] <= extra_mask[0][1]) &
-                (positions[:,1] > extra_mask[1][0]) & (positions[:,1] <= extra_mask[1][1]) & 
-                (positions[:,2] > extra_mask[2][0]) & (positions[:,2] <= extra_mask[2][1]))
-
-        density_field = np.zeros((grid_size, grid_size, grid_size))
-        dum = np.ones(grid_size, dtype=np.int64)
-        # density_field = accumulate_density_field(positions, masses, grid_size, box_size, density_field)
-        density_field = accumulate_density_field_vectorized(positions[m], masses[m], grid_size, box_size, dum)
-
-        fields[parttype] = density_field
-    
-    return fields
+    return density_field
 
 
 def calculate_overdensity(density_field, apodization=False, sigma=0):
@@ -189,61 +89,15 @@ def calculate_overdensity(density_field, apodization=False, sigma=0):
     return overdensity_field
 
 
-def run_overdensity(filename, grid_size, box_size, region, extra_mask=None):
+def accumulate_velocity_field(vx_field, vy_field, vz_field, ptype, positions, velocities, grid_size, box_size):
 
-    all_density_field = np.zeros((grid_size, grid_size, grid_size))
-    density_fields = prep_density_field(filename, grid_size, box_size, region=region, extra_mask=extra_mask) # TO-DO: implement weight interpolation. 
-    for k in density_fields.keys():
-        all_density_field += density_fields[k]
-    overdensity_field = calculate_overdensity(all_density_field, apodization=True, sigma=2.0)
-
-    return overdensity_field, density_fields['gas']
-
-
-def create_velocity_field(positions, vels, grid_size, box_size):
-
-    """Calculate average velocity in a cell"""
-    vx_field = np.zeros((grid_size, grid_size, grid_size))
-    vy_field = np.zeros((grid_size, grid_size, grid_size))
-    vz_field = np.zeros((grid_size, grid_size, grid_size))
-    
-    scaled_positions = (positions / box_size) * grid_size
-    
-    # Calculate the indices of the "lower left" corner grid point for each particle
-    indices = np.floor(scaled_positions).astype(int)
-    
-    # Calculate the distance of each particle from the "lower left" grid point in grid units
-    delta = scaled_positions - indices
-    
-    # For each particle, distribute its mass to the surrounding 8 grid points
-    for offset in [(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1),
-                   (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)]:
-        # Calculate the weight for the current offset
-        offset = np.array(offset)
-        weight = (1 - np.abs(delta - offset)).prod(axis=1)
+    """
+    positions: (Npart, 3)
+    masses: (Npart,)
+    density_field: (grid_size, grid_size, grid_size)
+    """
+    scaled_positions = (positions[ptype] / box_size) * grid_size
         
-        # Calculate the affected grid points, wrapping around using modulo for periodic boundary conditions
-        affected_indices = (indices + offset) % grid_size
-        
-        # Use np.add.at for unbuffered in-place addition, distributing weights to the density_field
-        np.add.at(vx_field, 
-                  (affected_indices[:, 0], affected_indices[:, 1], affected_indices[:, 2]), 
-                  weight * vels[:,0])
-        np.add.at(vy_field, 
-                  (affected_indices[:, 0], affected_indices[:, 1], affected_indices[:, 2]), 
-                  weight * vels[:,1])
-        np.add.at(vz_field, 
-                  (affected_indices[:, 0], affected_indices[:, 1], affected_indices[:, 2]), 
-                  weight * vels[:,2])
-    
-    return vx_field, vy_field, vz_field
-
-
-@guvectorize([(float64[:,:], float64[:,:], int64, float64, int64[:], float64[:,:,:], float64[:,:,:], float64[:,:,:])], '(n,m),(n,m),(),(),(p)->(p,p,p),(p,p,p),(p,p,p)', nopython=True)
-def create_velocity_field_vectorized(positions, vels, grid_size, box_size, dum, vx_field, vy_field, vz_field):
-    
-    scaled_positions = (positions / box_size) * grid_size
-    
     # Calculate the indices of the "lower left" corner grid point for each particle
     indices = np.floor(scaled_positions).astype(np.int64)
     
@@ -252,177 +106,200 @@ def create_velocity_field_vectorized(positions, vels, grid_size, box_size, dum, 
     
     # For each particle, distribute its mass to the surrounding 8 grid points
     for offset in [(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1),
-                   (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)]:
+                (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)]:
+
         # Calculate the weight for the current offset
         offset = np.array(offset)
+        # weight = (1 - np.abs(delta - offset)).prod(axis=1)
         w = 1 - np.abs(delta - offset)
         weight = w[:,0] * w[:,1] * w[:,2]
         
         # Calculate the affected grid points, wrapping around using modulo for periodic boundary conditions
         affected_indices = (indices + offset) % grid_size
 
-        for i in prange(len(weight)):
-            vx_field[affected_indices[i,0], affected_indices[i,1], affected_indices[i,2]] += weight[i]*vels[i,0]
-            vy_field[affected_indices[i,0], affected_indices[i,1], affected_indices[i,2]] += weight[i]*vels[i,1]
-            vz_field[affected_indices[i,0], affected_indices[i,1], affected_indices[i,2]] += weight[i]*vels[i,2]
-    
-    # return vx_field, vy_field, vz_field
+        vx_field = fill_field(vx_field, affected_indices, weight, weight*velocities[ptype][:,0])
+        vy_field = fill_field(vy_field, affected_indices, weight, weight*velocities[ptype][:,1])
+        vz_field = fill_field(vz_field, affected_indices, weight, weight*velocities[ptype][:,2])
+
+    return vx_field, vy_field, vz_field
 
 
-def create_any_field(positions, values, grid_size, box_size):
+def accumulate_any_field(field, ptype, positions, quant, grid_size, box_size):
 
-    field = np.zeros((grid_size, grid_size, grid_size))
-    
-    scaled_positions = (positions / box_size) * grid_size
-    
+    """
+    positions: (Npart, 3)
+    masses: (Npart,)
+    density_field: (grid_size, grid_size, grid_size)
+    """
+    scaled_positions = (positions[ptype] / box_size) * grid_size
+        
     # Calculate the indices of the "lower left" corner grid point for each particle
-    indices = np.floor(scaled_positions).astype(int)
+    indices = np.floor(scaled_positions).astype(np.int64)
     
     # Calculate the distance of each particle from the "lower left" grid point in grid units
     delta = scaled_positions - indices
     
     # For each particle, distribute its mass to the surrounding 8 grid points
     for offset in [(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1),
-                   (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)]:
+                (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)]:
+
         # Calculate the weight for the current offset
         offset = np.array(offset)
-        weight = (1 - np.abs(delta - offset)).prod(axis=1)
+        # weight = (1 - np.abs(delta - offset)).prod(axis=1)
+        w = 1 - np.abs(delta - offset)
+        weight = w[:,0] * w[:,1] * w[:,2]
         
         # Calculate the affected grid points, wrapping around using modulo for periodic boundary conditions
         affected_indices = (indices + offset) % grid_size
-        
-        # Use np.add.at for unbuffered in-place addition, distributing weights to the density_field
-        np.add.at(field, 
-                  (affected_indices[:, 0], affected_indices[:, 1], affected_indices[:, 2]), 
-                  weight * values)
+
+        field = fill_field(field, affected_indices, weight, weight*quant[ptype])
 
     return field
 
 
-@guvectorize([(float64[:,:], float64[:], int64, float64, int64[:], float64[:,:,:])], '(n,m),(n),(),(),(p)->(p,p,p)', nopython=True)
-def create_any_field_vectorized(positions, values, grid_size, box_size, dum, field):
-    
-    scaled_positions = (positions / box_size) * grid_size
-    
-    # Calculate the indices of the "lower left" corner grid point for each particle
-    indices = np.floor(scaled_positions).astype(np.int64)
-    
-    # Calculate the distance of each particle from the "lower left" grid point in grid units
-    delta = scaled_positions - indices
-    
-    # For each particle, distribute its mass to the surrounding 8 grid points
-    for offset in [(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1),
-                   (1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)]:
-        # Calculate the weight for the current offset
-        offset = np.array(offset)
-        w = 1 - np.abs(delta - offset)
-        weight = w[:,0] * w[:,1] * w[:,2]
-        
-        # Calculate the affected grid points, wrapping around using modulo for periodic boundary conditions
-        affected_indices = (indices + offset) % grid_size
+def main(argv):
+    # Compute 3D power spectrum of matter overdensity x velocity. 
+    outpath = "/cosma8/data/do012/dc-yama3/L1000N1800"
+    box_size = 1000.0 # Define the size of your simulation box in the same units as positions
+    box_num = 64
+    grid_size = 512 # Define grid resolution
+    snapshots = [i for i in range(78)] # [str(i).zfill(4) for i in range(78)]
+    snap = snapshots[int(sys.argv[1])]
+    # filenames = glob.glob('/cosma8/data/dp004/flamingo/Runs/L1000N1800/HYDRO_FIDUCIAL/snapshots/flamingo_%s/flamingo_%s.*.hdf5' % (snapshot, snapshot))
 
-        for i in prange(len(weight)):
-            field[affected_indices[i,0], affected_indices[i,1], affected_indices[i,2]] += weight[i]*values[i]
+    # MPI setup
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
 
-    # return field
+    # Script parameters
+    box_size = 1000
+    n_part = 1800
+    run = 'HYDRO_FIDUCIAL'
+    part_types = [0, 1, 6] # 0: Gas, 1: DM, 4: Stars, 5: BH, 6: Neutrino
 
-def calculate_velocity_field(a, ne, vx, vy, vz):
+    # Determine files to read on each rank
+    sim = f'L{box_size:04d}N{n_part:04d}/{run}'
+    snapshot_dir = f'/cosma8/data/dp004/flamingo/Runs/{sim}/snapshots/flamingo_{snap:04}'
+    if rank == 0:
+        with h5py.File(f'{snapshot_dir}/flamingo_{snap:04}.0.hdf5') as file:
+            n_chunk = file['Header'].attrs['NumFilesPerSnapshot'][0]
+            a = file['Cosmology'].attrs['Scale-factor'][0]
+        if size > n_chunk:
+            print('Running with more ranks than chunk files, some ranks will be idle')
+    else:
+        n_chunk = 0
+        a = 0
+    n_chunk = comm.bcast(n_chunk)
+    a = comm.bcast(a)
+    files_on_rank = assign_files(n_chunk, size)
+    first_file = np.cumsum(files_on_rank) - files_on_rank
 
-    """Calculate the velocity field (* make sure it's in the right units) M=0 component.
-    """
+    # Read files
+    load_start = time.time()
+    positions = {part_type: [] for part_type in part_types}
+    masses = {part_type: [] for part_type in part_types}
+    velocities = {0: []}
+    ne = {0: []}
+    for file_nr in range(
+        first_file[rank], first_file[rank] + files_on_rank[rank]
+        ):
+        filename = f'{snapshot_dir}/flamingo_{snap:04}.{file_nr}.hdf5'
+        with h5py.File(filename, 'r') as file:
+            for part_type in part_types:
+                positions[part_type].append(file[f'PartType{part_type}/Coordinates'][()])
+                masses[part_type].append(file[f'PartType{part_type}/Masses'][()])
+                if part_type == 0:
+                    velocities[part_type].append(file[f'PartType{part_type}/Velocities'][()])
+                    ne[part_type].append(file[f'PartType{part_type}/ElectronNumberDensities'][()])
+    print(f'Load time on rank {rank:03}: {time.time()-load_start}')
 
-    thomson_cross = 6.9842656e-74 # Mpc^2
-    tau_dot = thomson_cross * a * ne # Mpc^-1
-    v2 = tau_dot * 1/np.sqrt(6) * (-vx**2 - vy**2 + 2*vz**2)
+    density_fields = {}
+    for part_type in part_types:
+        compute_start = time.time()
+        # Combine data from different files on this rank
+        positions[part_type] = np.concatenate(positions[part_type], axis=0)
+        masses[part_type] = np.concatenate(masses[part_type], axis=0)
 
-    return v2
+        # Calculate density field
+        density_field = np.zeros((grid_size, grid_size, grid_size))
+        density_field = accumulate_density_field(density_field, part_type, positions, masses, grid_size, box_size)
+        density_fields[part_type] = density_field
 
+        # Compute velocity field.
+        if part_type == 0:
+            velocities[part_type] = np.concatenate(velocities[part_type], axis=0)
+            vx_field = np.zeros((grid_size, grid_size, grid_size)); vy_field = np.zeros((grid_size, grid_size, grid_size)); vz_field = np.zeros((grid_size, grid_size, grid_size))
+            vx_field, vy_field, vz_field = accumulate_velocity_field(vx_field, vy_field, vz_field, part_type, positions, velocities, grid_size, box_size)
+            vx = vx_field/density_field; vy = vy_field/density_field; vz = vz_field/density_field
 
-def run_velocity(gas_density_field, filename, grid_size, box_size, region, extra_mask=None):
+            ne[part_type] = np.concatenate(ne[part_type], axis=0)
+            ne_field = np.zeros((grid_size, grid_size, grid_size))
+            ne_field = accumulate_any_field(ne_field, part_type, positions, ne, grid_size, box_size)
+            v2_field = calculate_velocity_field(a, ne_field/density_field, vx, vy, vz)
+            v2_field = np.nan_to_num(v2_field, nan=0.0)
 
-    # Compute gas density weighted velocity field
-    gas_positions, gas_velocities = read_particle_positions(filename, 'gas', region=region, extra_mask=extra_mask)
-    # vx, vy, vz = create_velocity_field(gas_positions, gas_velocities, grid_size, box_size)
-    dum = np.ones(grid_size, dtype=np.int64)
-    vx_field = np.zeros((grid_size, grid_size, grid_size)); vy_field = np.zeros((grid_size, grid_size, grid_size)); vz_field = np.zeros((grid_size, grid_size, grid_size))
-    # vx_field, vy_field, vz_field = create_velocity_field(gas_positions, gas_velocities, grid_size, box_size)
-    vx_field, vy_field, vz_field = create_velocity_field_vectorized(gas_positions, gas_velocities, grid_size, box_size, dum)
-    vx = vx_field/gas_density_field; vy = vy_field/gas_density_field; vz = vz_field/gas_density_field
+        print(f'Compute time for PartType{part_type} on rank {rank:03}: {time.time()-compute_start}')
+    comm.Barrier()
 
-    a, ne = read_gas_info(filename, region=region, extra_mask=extra_mask)
-    ne_field = np.zeros((grid_size, grid_size, grid_size))
-    # ne_field = create_any_field(gas_positions, ne, grid_size, box_size)
-    ne_field = create_any_field_vectorized(gas_positions, ne, grid_size, box_size, dum)
-    v2_field = calculate_velocity_field(a, ne_field/gas_density_field, vx, vy, vz)
-    v2_field = np.nan_to_num(v2_field, nan=0.0)
+    all_density_field = np.zeros((grid_size, grid_size, grid_size))
+    for k in density_fields.keys():
+        all_density_field += density_fields[k]
+    overdensity_field = calculate_overdensity(all_density_field, apodization=True, sigma=2.0)
 
-    return v2_field
+    comm.Barrier()
 
-
-# Compute 3D power spectrum of matter overdensity x velocity. 
-outpath = "/cosma8/data/do012/dc-yama3/L1000N1800"
-box_size = 1000.0 # Define the size of your simulation box in the same units as positions
-box_num = 64
-grid_size = 512 # Define grid resolution
-n_jobs = -1
-snapshots = [str(i).zfill(4) for i in range(78)]
-snapshot = snapshots[0]
-filename = '/cosma8/data/dp004/flamingo/Runs/L1000N1800/HYDRO_FIDUCIAL/snapshots/flamingo_%s/flamingo_%s.hdf5' % (snapshot, snapshot)
-overdensity_3d = np.zeros((box_num, grid_size, grid_size, grid_size))
-velocity_3d = np.zeros((box_num, grid_size, grid_size, grid_size))
-# print('processing %s files' % str(len(filenames)))
-
-# Create regions constraints: [[left, right], [bottom, top], [front,back]]
-# load_regions contain regions created from sw object. load_regions_precise is created to ensure each chunk contains unique particles. 
-nregions = 64; nregions_1d = 4
-m = sw.mask(filename)
-boxsize = m.metadata.boxsize
-load_regions = []; load_regions_precise = []
-for i in range(nregions_1d): # left, right
-    left_right = [boxsize[0] * (i/nregions_1d), boxsize[0] * ((i+1)/nregions_1d)]
-    left_right_precise = [box_size * (i/nregions_1d), box_size * ((i+1)/nregions_1d)]
-    for j in range(nregions_1d): # bottom, top
-        bottom_top = [boxsize[1] * (j/nregions_1d), boxsize[1] * ((j+1)/nregions_1d)]
-        bottom_top_precise = [box_size * (j/nregions_1d), box_size * ((j+1)/nregions_1d)]
-        for k in range(nregions_1d): # front, back
-            front_back = [boxsize[2] * (k/nregions_1d), boxsize[2] * ((k+1)/nregions_1d)]
-            front_back_precise = [box_size * (k/nregions_1d), box_size * ((k+1)/nregions_1d)]
-            load_regions.append([left_right, bottom_top, front_back])
-            load_regions_precise.append([left_right_precise, bottom_top_precise, front_back_precise])
-
-overdensity_jobs = [
-                    joblib.delayed(run_overdensity)(filename, grid_size, box_size, region, extra_mask=extra_region)
-                    for (region, extra_region) in zip(load_regions, load_regions_precise)
-                    ]
-with joblib.Parallel(n_jobs=n_jobs, backend="loky", prefer='threads', verbose=10) as par:
-    overdensity_fields,gas_fields = par(overdensity_jobs)
-for overdensity_field in overdensity_fields:
-    overdensity_3d[i,:,:,:] = overdensity_field
-
-velocity_jobs = [
-                joblib.delayed(run_velocity)(gas_fields[i], filename, grid_size, box_size, region, extra_mask=extra_region)
-                for i,(region,extra_region) in enumerate(zip(load_regions, load_regions_precise))
-                ]
-with joblib.Parallel(n_jobs=n_jobs, backend="loky", prefer='threads', verbose=10) as par:
-    velocity_fields = par(velocity_jobs)
-for velocity_field in velocity_fields:
-    velocity_3d[i,:,:,:] = velocity_field
+    # save info on each rank.
+    if not os.path.exists(os.path.join(outpath, 'snapshot_%s/overdensity_3d_snapshot_%s_%s.fits' % (snap, snap, rank))):
+            fits = fio.FITS(os.path.join(outpath, 'snapshot_%s/overdensity_3d_snapshot_%s_%s.fits' % (snap, snap, rank)), 'rw')
+            fits.write(overdensity_field)
+            fits.close()
+    print('Done writing out for overdensity')
+    if not os.path.exists(os.path.join(outpath, 'snapshot_%s/velocity_3d_snapshot_%s_%s.fits' % (snap, snap, rank))):
+        fits = fio.FITS(os.path.join(outpath, 'snapshot_%s/velocity_3d_snapshot_%s_%s.fits' % (snap, snap, rank)), 'rw')
+        fits.write(v2_field)
+        fits.close()
+    print('Done writing out for velocity')
 
 
-fits = fio.FITS('/cosma8/data/do012/dc-yama3/L1000N1800/overdensity_3d_snapshot_multithreads_vectorized_fulltest.fits', 'rw')
-fits.write(overdensity_3d)
-fits.close()
+    # # send overdensity info
+    # if rank != 0:
+    #     print('sending overdensity info from: ', rank)
+    #     comm.bcast(overdensity_field, root=0)
+    # comm.Barrier()
+    # if rank == 0:
+    #     print('receiving overdensity info')
+    #     overdensity_3d = np.zeros((box_num, grid_size, grid_size, grid_size))
+    #     for i in range(1,size):
+    #         tmp_res = comm.recv(source=i)
+    #         overdensity_3d[i,:,:,:] = tmp_res
+    # comm.Barrier()
 
-fits = fio.FITS('/cosma8/data/do012/dc-yama3/L1000N1800/velocity_3d_snapshot_multithreads_vectorized_fulltest.fits', 'rw')
-fits.write(velocity_3d)
-fits.close()
+    # # send velocity info
+    # if rank != 0:
+    #     print('sending velocity info from: ', rank)
+    #     comm.bcast(v2_field, root=0)
+    # comm.Barrier()
+    # if rank == 0:
+    #     print('receiving velocity info')
+    #     velocity_3d = np.zeros((box_num, grid_size, grid_size, grid_size))
+    #     for i in range(1,size):
+    #         tmp_res = comm.recv(source=i)
+    #         velocity_3d[i,:,:,:] = tmp_res
+    # comm.Barrier()
 
-exit()
-if not os.path.exists(os.path.join(outpath, 'snapshot_%s/overdensity_3d_snapshot_%s.fits' % (snapshot, snapshot))):
-    fits = fio.FITS(os.path.join(outpath, 'snapshot_%s/overdensity_3d_snapshot_%s.fits' % (snapshot, snapshot)), 'rw')
-    fits.write(overdensity_3d)
-    fits.close()
-if not os.path.exists(os.path.join(outpath, 'snapshot_%s/velocity_3d_snapshot_%s.fits' % (snapshot, snapshot))):
-    fits = fio.FITS(os.path.join(outpath, 'snapshot_%s/velocity_3d_snapshot_%s.fits' % (snapshot, snapshot)), 'rw')
-    fits.write(velocity_3d)
-    fits.close()
+    # if rank == 0:
+    #     if not os.path.exists(os.path.join(outpath, 'snapshot_%s/overdensity_3d_snapshot_%s.fits' % (snapshot, snapshot))):
+    #         fits = fio.FITS(os.path.join(outpath, 'snapshot_%s/overdensity_3d_snapshot_%s.fits' % (snapshot, snapshot)), 'rw')
+    #         fits.write(overdensity_3d)
+    #         fits.close()
+    #     print('Done writing out for overdensity')
+    #     if not os.path.exists(os.path.join(outpath, 'snapshot_%s/velocity_3d_snapshot_%s.fits' % (snapshot, snapshot))):
+    #         fits = fio.FITS(os.path.join(outpath, 'snapshot_%s/velocity_3d_snapshot_%s.fits' % (snapshot, snapshot)), 'rw')
+    #         fits.write(velocity_3d)
+    #         fits.close()
+    #     print('Done writing out for velocity')
+
+
+if __name__ == "__main__":
+    main(sys.argv)
